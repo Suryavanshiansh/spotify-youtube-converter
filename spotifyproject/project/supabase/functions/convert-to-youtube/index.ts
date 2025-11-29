@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { Innertube, UniversalCache } from "npm:youtubei.js";
 
+// ---------------- CONFIG ----------------
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -17,6 +18,8 @@ interface Track {
 
 let yt: Innertube | null = null;
 
+// ---------------- HELPERS ----------------
+
 async function getClient() {
   if (!yt) {
     yt = await Innertube.create({
@@ -27,103 +30,118 @@ async function getClient() {
   return yt;
 }
 
-function normalize(text: string) {
-  return text.toLowerCase()
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+const normalize = (text: string) =>
+  text.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+
+// Levenshtein similarity function
+function similarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1,
+        );
+      }
+    }
+  }
+
+  const score = 1 - matrix[b.length][a.length] / Math.max(a.length, b.length);
+  return score;
 }
 
-function cleanTitle(name: string) {
-  return name
+function cleanTitle(title: string): string {
+  return title
     .replace(/\(feat.*?\)/gi, "")
     .replace(/ - from ".*?"/gi, "")
-    .replace(/\[.*?]/g, "")
+    .replace(/\[.*]/g, "")
     .replace(/\(.*?version.*?\)/gi, "")
+    .replace(/\s+official.*$/gi, "")
     .trim();
 }
 
-async function smartSearch(query: string, title: string, artist: string) {
+// Search + fuzzy match scoring
+async function searchYouTubeTrack(name: string, artist: string) {
   const yt = await getClient();
-  const cleaned = normalize(title);
-  const artistNorm = normalize(artist);
 
-  let results = await yt.music.search(query);
+  const queries = [
+    `${name} ${artist}`,
+    `${name} official audio`,
+    `${name} original song`,
+    `${name} ${artist} lyrics`,
+    `${name} movie song`,
+  ];
 
-  if (!results || results.length === 0) {
-    results = await yt.search(query);
-  }
-
-  let best = null;
+  let bestMatch = null;
   let bestScore = 0;
 
-  for (const r of results as any[]) {
-    const t = normalize(r.title ?? "");
-    const a = normalize((r.artists?.map((x: any) => x.name).join(" ") || r.author || ""));
+  for (const q of queries) {
+    const res = [...await yt.music.search(q), ...await yt.search(q)];
 
-    let score = 0;
+    for (const r of res as any[]) {
+      const titleNorm = normalize(r.title ?? "");
+      const artistNorm = normalize((r.author || r.artists?.map((x: any) => x.name).join(" ")) ?? "");
 
-    if (r.type === "song") score += 1.5;
-    if (r.isOfficial) score += 1;
-    if (t.includes(cleaned)) score += 2;
+      let score = similarity(normalize(name), titleNorm) * 2;
 
-    for (const w of cleaned.split(" ")) {
-      if (w.length > 2 && t.includes(w)) score += 0.2;
-    }
+      if (artist && artistNorm.includes(normalize(artist))) score += 1;
+      if (/official|audio|soundtrack|ost/.test(titleNorm)) score += 0.3;
+      if (/slowed|reverb|sped up|remix|live/.test(titleNorm)) score -= 1;
 
-    if (artistNorm && a.includes(artistNorm)) score += 1;
-
-    if (/official|audio|video|soundtrack|ost/.test(t)) score += 0.3;
-    if (/slowed|reverb|sped up|trap|mix|live/.test(t)) score -= 1;
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = r;
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = r;
+      }
     }
   }
 
-  return best?.id ?? null;
+  return bestScore >= 0.55 ? bestMatch?.id ?? null : null;
 }
 
+// ---------------- MAIN FUNCTION ----------------
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
   try {
     const { tracks, playlistName, spotifyUrl } = await req.json();
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
 
-    let results: Track[] = [];
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    );
+
+    let final: Track[] = [];
     let success = 0;
 
     for (const track of tracks) {
       const cleaned = cleanTitle(track.name);
-      const query = `${cleaned} ${track.artists[0]}`;
-      const id = await smartSearch(query, cleaned, track.artists[0]);
+      const id = await searchYouTubeTrack(cleaned, track.artists[0]);
 
-      results.push({ ...track, youtubeId: id || undefined, found: !!id });
+      final.push({ ...track, youtubeId: id || undefined, found: !!id });
       if (id) success++;
     }
 
     await supabase.from("conversion_history").insert({
-      spotify_playlist_name: playlistName,
-      spotify_playlist_url: spotifyUrl,
-      track_count: tracks.length,
-      successful_conversions: success,
+      playlistName,
+      spotifyUrl,
+      trackCount: tracks.length,
+      successCount: success,
     });
 
     return new Response(
-      JSON.stringify({
-        tracks: results,
-        success,
-        total: tracks.length,
-      }),
-      { status: 200, headers: corsHeaders }
+      JSON.stringify({ tracks: final, total: tracks.length, success }),
+      { status: 200, headers: corsHeaders },
     );
 
   } catch (e) {
-    console.error(e);
     return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
   }
 });
