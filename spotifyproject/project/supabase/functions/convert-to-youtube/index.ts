@@ -1,7 +1,9 @@
+/// <reference types="https://esm.sh/jsr/@supabase/functions-js@latest/types/edge-runtime.d.ts" />
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { Innertube, UniversalCache } from "npm:youtubei.js";
 
-const corsHeaders = {
+const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers":
@@ -15,7 +17,21 @@ interface Track {
   found?: boolean;
 }
 
+// Keep a single YouTube Music client instance (hot-reload friendly)
+let yt: Innertube | null = null;
+
+async function getYouTubeMusicClient(): Promise<Innertube> {
+  if (!yt) {
+    yt = await Innertube.create({
+      cache: new UniversalCache(false),
+      retrieve_player: false,
+    });
+  }
+  return yt;
+}
+
 Deno.serve(async (req: Request) => {
+  // Handle CORS preflight
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 200,
@@ -24,37 +40,39 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { tracks, playlistName, spotifyUrl } = await req.json();
+    const body = await req.json().catch(() => null);
 
-    if (!tracks || !Array.isArray(tracks)) {
-      return new Response(
-        JSON.stringify({ error: "Tracks array is required" }),
-        {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        },
-      );
+    if (!body) {
+      return jsonError("Invalid JSON body", 400);
     }
 
-    const youtubeApiKey = Deno.env.get("YOUTUBE_API_KEY");
-    if (!youtubeApiKey) {
-      throw new Error("YouTube API key not configured");
+    const { tracks, playlistName, spotifyUrl } = body as {
+      tracks: Track[];
+      playlistName?: string;
+      spotifyUrl?: string;
+    };
+
+    if (!tracks || !Array.isArray(tracks)) {
+      return jsonError("Tracks array is required", 400);
     }
 
     const convertedTracks: Track[] = [];
     let successfulConversions = 0;
 
-    for (const track of tracks as Track[]) {
-      // Clean the Spotify title to better match YouTube titles
+    const client = await getYouTubeMusicClient();
+
+    for (const track of tracks) {
       const cleanedName = cleanTrackName(track.name);
       const primaryArtist = track.artists?.[0] ?? "";
 
-      const searchQuery = `${cleanedName} ${primaryArtist} official audio`;
+      // Build a query that works well for YT Music
+      const query = `${cleanedName} ${primaryArtist}`.trim();
 
       const videoId = await searchYouTubeMusic(
-        searchQuery,
+        client,
+        query,
         cleanedName,
-        youtubeApiKey,
+        primaryArtist,
       );
 
       convertedTracks.push({
@@ -63,131 +81,146 @@ Deno.serve(async (req: Request) => {
         found: !!videoId,
       });
 
-      if (videoId) {
-        successfulConversions++;
-      }
+      if (videoId) successfulConversions++;
     }
 
     // Save conversion summary to Supabase
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-    await supabase.from("conversion_history").insert({
-      spotify_playlist_url: spotifyUrl,
-      spotify_playlist_name: playlistName,
-      track_count: tracks.length,
-      successful_conversions: successfulConversions,
-    });
+    if (!supabaseUrl || !supabaseKey) {
+      console.error("Supabase credentials not configured in environment");
+    } else {
+      const supabase = createClient(supabaseUrl, supabaseKey);
+      try {
+        await supabase.from("conversion_history").insert({
+          spotify_playlist_url: spotifyUrl ?? null,
+          spotify_playlist_name: playlistName ?? null,
+          track_count: tracks.length,
+          successful_conversions: successfulConversions,
+        });
+      } catch (err) {
+        console.error("Failed to insert conversion history:", err);
+      }
+    }
 
-    const youtubePlaylistUrl =
-      convertedTracks.length > 0 && convertedTracks[0].youtubeId
-        ? `https://music.youtube.com/watch?v=${convertedTracks[0].youtubeId}&list=RD${convertedTracks[0].youtubeId}`
-        : null;
+    const firstFound = convertedTracks.find((t) => t.youtubeId);
 
-    return new Response(
-      JSON.stringify({
+    const youtubePlaylistUrl = firstFound?.youtubeId
+      ? `https://music.youtube.com/watch?v=${firstFound.youtubeId}&list=RD${firstFound.youtubeId}`
+      : null;
+
+    return jsonResponse(
+      {
         tracks: convertedTracks,
         youtubePlaylistUrl,
         successfulConversions,
         totalTracks: tracks.length,
-      }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
       },
+      200,
     );
   } catch (error) {
-    console.error("Error converting to YouTube:", error);
-    return new Response(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "An error occurred",
-      }),
+    console.error("Error converting to YouTube Music:", error);
+    return jsonResponse(
       {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        error:
+          error instanceof Error ? error.message : "An unknown error occurred",
       },
+      500,
     );
   }
 });
 
 /**
- * Clean Spotify track titles so they match YouTube titles better.
- * Removes things like: - From "Movie", (From "Movie"), (feat. ...), etc.
+ * Clean Spotify track titles so they match YouTube Music titles better.
+ * Removes things like: - From "Movie", (From "Movie"), (feat. ...), [Official Video], etc.
  */
 function cleanTrackName(name: string): string {
   return name
-    .replace(/ - From ".*"/i, "")       // Sauda Khara Khara - From "Good Newwz"
-    .replace(/\(From ".*"\)/i, "")      // Sauda Khara Khara (From "Good Newwz")
-    .replace(/\(feat\..*\)/i, "")       // Song (feat. Artist)
-    .replace(/ - feat\..*/i, "")        // Song - feat. Artist
-    .replace(/\s+\[[^\]]+\]/g, "")      // [Official Video], [Audio], etc.
+    .replace(/ - From ".*"/gi, "") // Song - From "Movie"
+    .replace(/\(From ".*"\)/gi, "") // Song (From "Movie")
+    .replace(/\(feat\..*\)/gi, "") // Song (feat. Artist)
+    .replace(/ - feat\..*/gi, "") // Song - feat. Artist
+    .replace(/\s+\[[^\]]+\]/g, "") // [Official Video], [Audio], etc.
     .trim();
 }
 
 /**
- * Search YouTube for the best matching music video.
- * Uses top 5 results and picks the closest title match.
+ * Search on YouTube Music (via youtubei.js) and pick the best matching track.
  */
 async function searchYouTubeMusic(
+  yt: Innertube,
   query: string,
   cleanedTitle: string,
-  apiKey: string,
+  primaryArtist: string,
 ): Promise<string | null> {
   try {
-    const searchUrl = new URL("https://www.googleapis.com/youtube/v3/search");
-    searchUrl.searchParams.append("part", "snippet");
-    searchUrl.searchParams.append("q", query);
-    searchUrl.searchParams.append("type", "video");
-    // Don't restrict to videoCategoryId=10; many music uploads aren't tagged as "Music"
-    searchUrl.searchParams.append("maxResults", "5");
-    searchUrl.searchParams.append("key", apiKey);
+    const results = await yt.music.search(query);
 
-    const response = await fetch(searchUrl.toString());
-
-    if (!response.ok) {
-      console.error("YouTube API error:", await response.text());
+    if (!results || results.length === 0) {
       return null;
     }
 
-    const data = await response.json();
-
-    if (!data.items || data.items.length === 0) {
-      return null;
-    }
-
-    // Normalize helper for loose matching
     const normalize = (s: string) =>
-      s.toLowerCase()
+      s
+        .toLowerCase()
         .replace(/[^a-z0-9\s]/gi, " ")
         .replace(/\s+/g, " ")
         .trim();
 
-    const normalizedTitle = normalize(cleanedTitle);
-    let bestItem = data.items[0];
-    let bestScore = 0;
+    const normTitle = normalize(cleanedTitle);
+    const normArtist = normalize(primaryArtist);
 
-    for (const item of data.items) {
-      const title = normalize(item.snippet?.title ?? "");
+    let best: any = results[0];
+    let bestScore = -1;
+
+    for (const item of results as any[]) {
+      const title = normalize(item.title ?? "");
+      const artists =
+        (item.artists?.map((a: any) => normalize(a.name)).join(" ") ?? "") +
+        " " +
+        (item.author ? normalize(item.author) : "");
+
       let score = 0;
 
-      // Strong bonus if entire cleaned title appears inside candidate title
-      if (title.includes(normalizedTitle)) score += 2;
+      // Prefer songs / official music content
+      if (item.type === "song") score += 2;
+      if (item.isOfficial) score += 1;
 
-      // Light bonus for overlapping words
-      for (const w of normalizedTitle.split(" ")) {
+      // Title similarity
+      if (title.includes(normTitle)) score += 2;
+      for (const w of normTitle.split(" ")) {
         if (w && title.includes(w)) score += 0.25;
+      }
+
+      // Artist similarity
+      if (normArtist && artists.includes(normArtist)) score += 1;
+      for (const w of normArtist.split(" ")) {
+        if (w && artists.includes(w)) score += 0.2;
       }
 
       if (score > bestScore) {
         bestScore = score;
-        bestItem = item;
+        best = item;
       }
     }
 
-    return bestItem.id?.videoId ?? null;
+    return best?.id ?? null;
   } catch (error) {
-    console.error("Error searching YouTube:", error);
+    console.error("YT Music search error:", error);
     return null;
   }
+}
+
+/** Helper to send JSON responses */
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+/** Helper to send error JSON */
+function jsonError(message: string, status = 400): Response {
+  return jsonResponse({ error: message }, status);
 }
