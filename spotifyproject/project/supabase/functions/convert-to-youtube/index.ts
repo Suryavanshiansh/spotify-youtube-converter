@@ -1,13 +1,11 @@
-/// <reference types="https://esm.sh/jsr/@supabase/functions-js@latest/types/edge-runtime.d.ts" />
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { Innertube, UniversalCache } from "npm:youtubei.js";
 
-const corsHeaders: Record<string, string> = {
+const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, X-Client-Info, Apikey",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
 interface Track {
@@ -17,10 +15,9 @@ interface Track {
   found?: boolean;
 }
 
-// Keep a single YouTube Music client instance (hot-reload friendly)
 let yt: Innertube | null = null;
 
-async function getYouTubeMusicClient(): Promise<Innertube> {
+async function getClient() {
   if (!yt) {
     yt = await Innertube.create({
       cache: new UniversalCache(false),
@@ -30,197 +27,103 @@ async function getYouTubeMusicClient(): Promise<Innertube> {
   return yt;
 }
 
-Deno.serve(async (req: Request) => {
-  // Handle CORS preflight
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 200,
-      headers: corsHeaders,
-    });
-  }
-
-  try {
-    const body = await req.json().catch(() => null);
-
-    if (!body) {
-      return jsonError("Invalid JSON body", 400);
-    }
-
-    const { tracks, playlistName, spotifyUrl } = body as {
-      tracks: Track[];
-      playlistName?: string;
-      spotifyUrl?: string;
-    };
-
-    if (!tracks || !Array.isArray(tracks)) {
-      return jsonError("Tracks array is required", 400);
-    }
-
-    const convertedTracks: Track[] = [];
-    let successfulConversions = 0;
-
-    const client = await getYouTubeMusicClient();
-
-    for (const track of tracks) {
-      const cleanedName = cleanTrackName(track.name);
-      const primaryArtist = track.artists?.[0] ?? "";
-
-      // Build a query that works well for YT Music
-      const query = `${cleanedName} ${primaryArtist}`.trim();
-
-      const videoId = await searchYouTubeMusic(
-        client,
-        query,
-        cleanedName,
-        primaryArtist,
-      );
-
-      convertedTracks.push({
-        ...track,
-        youtubeId: videoId || undefined,
-        found: !!videoId,
-      });
-
-      if (videoId) successfulConversions++;
-    }
-
-    // Save conversion summary to Supabase
-    const supabaseUrl = Deno.env.get("SUPABASE_URL");
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-    if (!supabaseUrl || !supabaseKey) {
-      console.error("Supabase credentials not configured in environment");
-    } else {
-      const supabase = createClient(supabaseUrl, supabaseKey);
-      try {
-        await supabase.from("conversion_history").insert({
-          spotify_playlist_url: spotifyUrl ?? null,
-          spotify_playlist_name: playlistName ?? null,
-          track_count: tracks.length,
-          successful_conversions: successfulConversions,
-        });
-      } catch (err) {
-        console.error("Failed to insert conversion history:", err);
-      }
-    }
-
-    const firstFound = convertedTracks.find((t) => t.youtubeId);
-
-    const youtubePlaylistUrl = firstFound?.youtubeId
-      ? `https://music.youtube.com/watch?v=${firstFound.youtubeId}&list=RD${firstFound.youtubeId}`
-      : null;
-
-    return jsonResponse(
-      {
-        tracks: convertedTracks,
-        youtubePlaylistUrl,
-        successfulConversions,
-        totalTracks: tracks.length,
-      },
-      200,
-    );
-  } catch (error) {
-    console.error("Error converting to YouTube Music:", error);
-    return jsonResponse(
-      {
-        error:
-          error instanceof Error ? error.message : "An unknown error occurred",
-      },
-      500,
-    );
-  }
-});
-
-/**
- * Clean Spotify track titles so they match YouTube Music titles better.
- * Removes things like: - From "Movie", (From "Movie"), (feat. ...), [Official Video], etc.
- */
-function cleanTrackName(name: string): string {
-  return name
-    .replace(/ - From ".*"/gi, "") // Song - From "Movie"
-    .replace(/\(From ".*"\)/gi, "") // Song (From "Movie")
-    .replace(/\(feat\..*\)/gi, "") // Song (feat. Artist)
-    .replace(/ - feat\..*/gi, "") // Song - feat. Artist
-    .replace(/\s+\[[^\]]+\]/g, "") // [Official Video], [Audio], etc.
+function normalize(text: string) {
+  return text.toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-/**
- * Search on YouTube Music (via youtubei.js) and pick the best matching track.
- */
-async function searchYouTubeMusic(
-  yt: Innertube,
-  query: string,
-  cleanedTitle: string,
-  primaryArtist: string,
-): Promise<string | null> {
-  try {
-    const results = await yt.music.search(query);
+function cleanTitle(name: string) {
+  return name
+    .replace(/\(feat.*?\)/gi, "")
+    .replace(/ - from ".*?"/gi, "")
+    .replace(/\[.*?]/g, "")
+    .replace(/\(.*?version.*?\)/gi, "")
+    .trim();
+}
 
-    if (!results || results.length === 0) {
-      return null;
-    }
+async function smartSearch(query: string, title: string, artist: string) {
+  const yt = await getClient();
+  const cleaned = normalize(title);
+  const artistNorm = normalize(artist);
 
-    const normalize = (s: string) =>
-      s
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/gi, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+  let results = await yt.music.search(query);
 
-    const normTitle = normalize(cleanedTitle);
-    const normArtist = normalize(primaryArtist);
-
-    let best: any = results[0];
-    let bestScore = -1;
-
-    for (const item of results as any[]) {
-      const title = normalize(item.title ?? "");
-      const artists =
-        (item.artists?.map((a: any) => normalize(a.name)).join(" ") ?? "") +
-        " " +
-        (item.author ? normalize(item.author) : "");
-
-      let score = 0;
-
-      // Prefer songs / official music content
-      if (item.type === "song") score += 2;
-      if (item.isOfficial) score += 1;
-
-      // Title similarity
-      if (title.includes(normTitle)) score += 2;
-      for (const w of normTitle.split(" ")) {
-        if (w && title.includes(w)) score += 0.25;
-      }
-
-      // Artist similarity
-      if (normArtist && artists.includes(normArtist)) score += 1;
-      for (const w of normArtist.split(" ")) {
-        if (w && artists.includes(w)) score += 0.2;
-      }
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = item;
-      }
-    }
-
-    return best?.id ?? null;
-  } catch (error) {
-    console.error("YT Music search error:", error);
-    return null;
+  if (!results || results.length === 0) {
+    results = await yt.search(query);
   }
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const r of results as any[]) {
+    const t = normalize(r.title ?? "");
+    const a = normalize((r.artists?.map((x: any) => x.name).join(" ") || r.author || ""));
+
+    let score = 0;
+
+    if (r.type === "song") score += 1.5;
+    if (r.isOfficial) score += 1;
+    if (t.includes(cleaned)) score += 2;
+
+    for (const w of cleaned.split(" ")) {
+      if (w.length > 2 && t.includes(w)) score += 0.2;
+    }
+
+    if (artistNorm && a.includes(artistNorm)) score += 1;
+
+    if (/official|audio|video|soundtrack|ost/.test(t)) score += 0.3;
+    if (/slowed|reverb|sped up|trap|mix|live/.test(t)) score -= 1;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = r;
+    }
+  }
+
+  return best?.id ?? null;
 }
 
-/** Helper to send JSON responses */
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
-}
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
-/** Helper to send error JSON */
-function jsonError(message: string, status = 400): Response {
-  return jsonResponse({ error: message }, status);
-}
+  try {
+    const { tracks, playlistName, spotifyUrl } = await req.json();
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    let results: Track[] = [];
+    let success = 0;
+
+    for (const track of tracks) {
+      const cleaned = cleanTitle(track.name);
+      const query = `${cleaned} ${track.artists[0]}`;
+      const id = await smartSearch(query, cleaned, track.artists[0]);
+
+      results.push({ ...track, youtubeId: id || undefined, found: !!id });
+      if (id) success++;
+    }
+
+    await supabase.from("conversion_history").insert({
+      spotify_playlist_name: playlistName,
+      spotify_playlist_url: spotifyUrl,
+      track_count: tracks.length,
+      successful_conversions: success,
+    });
+
+    return new Response(
+      JSON.stringify({
+        tracks: results,
+        success,
+        total: tracks.length,
+      }),
+      { status: 200, headers: corsHeaders }
+    );
+
+  } catch (e) {
+    console.error(e);
+    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
+  }
+});
